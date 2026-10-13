@@ -1,0 +1,4 @@
+streamlit>=1.37,<2
+pandas>=2.0,<3
+numpy>=1.25,<3
+requests>=2.31,<3
