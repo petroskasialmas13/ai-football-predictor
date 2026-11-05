@@ -87,10 +87,10 @@ def test_blocks_respect_window():
 # ---------------------------------------------------------------- comparison
 def test_comparison_same_match_set(comparison):
     m = comparison.metrics
-    assert list(m["Μοντέλο"]) == ["Poisson", "Dixon-Coles", "Elo", "Βάση"]
+    assert list(m["Μοντέλο"]) == ["Poisson", "Dixon-Coles", "Elo", "Ensemble", "Βάση"]
     assert (m["Αγώνες"] == comparison.evaluated).all()
     assert comparison.evaluated + comparison.skipped == 40
-    for name in ("Poisson", "Dixon-Coles", "Elo", "Βάση"):
+    for name in ("Poisson", "Dixon-Coles", "Elo", "Ensemble", "Βάση"):
         probs = np.vstack(comparison.predictions[name].to_numpy())
         assert probs.shape == (comparison.evaluated, 3)
         assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-9)
@@ -124,7 +124,7 @@ def test_no_leakage_future_results_do_not_change_predictions(league):
     merged = preds.merge(after, on=["date", "home_team", "away_team"], suffixes=("", "_t"))
     upto = merged[merged["date"] <= target["date"]]
     assert len(upto) >= 11
-    for name in ("Poisson", "Dixon-Coles", "Βάση"):
+    for name in ("Poisson", "Dixon-Coles", "Elo", "Ensemble", "Βάση"):
         a = np.vstack(upto[name].to_numpy())
         b = np.vstack(upto[f"{name}_t"].to_numpy())
         assert np.allclose(a, b, atol=1e-12), name

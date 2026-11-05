@@ -35,6 +35,12 @@ BACKTEST_MIN_HISTORY = 50
 BACKTEST_MIN_EVALUATED = 10
 BACKTEST_DEFAULT_MATCHES = 60
 
+# --- Ensemble (Poisson + Dixon-Coles + Elo) --------------------------------
+ENSEMBLE_MIN_MATCHES = 20         # below this many past predictions -> equal weights
+# Modelling assumption: strength of the pull toward equal weights, expressed as
+# "pseudo-matches" (penalty = ENSEMBLE_PRIOR_MATCHES / n * sum (w - 1/M)^2).
+ENSEMBLE_PRIOR_MATCHES = 10
+
 # --- Markets ---------------------------------------------------------------
 OVER_UNDER_LINES = (0.5, 1.5, 2.5, 3.5, 4.5)
 

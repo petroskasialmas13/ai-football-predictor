@@ -1,4 +1,4 @@
-"""Leakage-free comparative backtest: Poisson vs Dixon-Coles vs Elo vs league baseline.
+"""Leakage-free comparative backtest: Poisson vs Dixon-Coles vs Elo vs Ensemble vs league baseline.
 
 For every evaluated match only matches played strictly before it are used.
 
@@ -9,6 +9,10 @@ before the FIRST match of the block.
 
 All models are scored on the SAME set of matches: if any model cannot predict a
 match (e.g. too little history), the match is skipped for all of them.
+
+Ensemble (walk-forward): for each evaluated match, the ensemble weights are
+learned only from the predictions/outcomes of evaluated matches played strictly
+earlier (equal weights until enough of them exist).
 """
 from __future__ import annotations
 
@@ -23,10 +27,11 @@ import config
 from engine import analyze
 from models.dixon_coles import DixonColesModel
 from models.elo import EloModel
+from models.ensemble import ENSEMBLE_MODELS, EnsembleWeights, combine, fit_weights
 from utils.data import prepare_history
 
 LOG_LOSS_EPS = 1e-15
-MODEL_NAMES = ("Poisson", "Dixon-Coles", "Elo", "Βάση")
+MODEL_NAMES = ("Poisson", "Dixon-Coles", "Elo", "Ensemble", "Βάση")
 
 
 def outcome_index(home_goals: int, away_goals: int) -> int:
@@ -66,6 +71,7 @@ class ComparisonResult:
     dc_refits: int
     dc_not_converged: int
     elo_refits: int
+    ensemble_weights: EnsembleWeights      # learned on ALL evaluated matches (for future matches)
     elapsed_seconds: float
     refit_days: int
     notes: list[str] = field(default_factory=list)
@@ -80,6 +86,32 @@ def _baseline(past: pd.DataFrame) -> tuple[np.ndarray, float]:
     n_over = int(((past.home_goals + past.away_goals) > 2.5).sum())
     p_over = (n_over + 1) / (len(past) + 2)
     return p1x2, float(p_over)
+
+
+def weights_from_predictions(preds: pd.DataFrame) -> EnsembleWeights:
+    """Fit ensemble weights on (already out-of-sample) backtest predictions."""
+    if preds.empty:
+        return EnsembleWeights.equal()
+    return fit_weights({m: np.vstack(preds[m].to_numpy()) for m in ENSEMBLE_MODELS},
+                       preds["outcome"].to_numpy(),
+                       {m: preds[f"{m}_over25"].to_numpy(dtype=float) for m in ENSEMBLE_MODELS},
+                       preds["over25"].to_numpy())
+
+
+def _add_walk_forward_ensemble(preds: pd.DataFrame) -> None:
+    """Add Ensemble columns; weights for a match use only strictly earlier matches."""
+    ens_1x2, ens_over = [], []
+    cache: dict[pd.Timestamp, EnsembleWeights] = {}
+    for _, row in preds.iterrows():
+        if row.date not in cache:
+            cache[row.date] = weights_from_predictions(preds[preds.date < row.date])
+        probs = {m: {"1": row[m][0], "X": row[m][1], "2": row[m][2],
+                     "Over 2.5": row[f"{m}_over25"]} for m in ENSEMBLE_MODELS}
+        p = combine(probs, cache[row.date])["probabilities"]
+        ens_1x2.append([p["1"], p["X"], p["2"]])
+        ens_over.append(p["Over 2.5"])
+    preds["Ensemble"] = ens_1x2
+    preds["Ensemble_over25"] = ens_over
 
 
 def _blocks(dates: pd.Series, refit_days: int) -> list[list[int]]:
@@ -182,6 +214,7 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
         raise ValueError(f"Μόνο {len(rows)} αγώνες μπορούν να ελεγχθούν από όλα τα μοντέλα "
                          f"({skipped} αποκλείστηκαν). Χρειάζονται τουλάχιστον {config.BACKTEST_MIN_EVALUATED}.")
     preds = pd.DataFrame(rows)
+    _add_walk_forward_ensemble(preds)
     y = preds["outcome"].to_numpy()
     y_over = preds["over25"].to_numpy()
     metric_rows = []
@@ -195,6 +228,6 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
     return ComparisonResult(
         metrics=pd.DataFrame(metric_rows), predictions=preds, evaluated=len(preds), skipped=skipped,
         skip_reasons=reasons, dc_refits=dc_refits, dc_not_converged=dc_not_converged,
-        elo_refits=elo_refits,
+        elo_refits=elo_refits, ensemble_weights=weights_from_predictions(preds),
         elapsed_seconds=time.perf_counter() - started, refit_days=int(refit_days),
     )
