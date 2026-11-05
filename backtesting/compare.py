@@ -1,15 +1,11 @@
-"""Leakage-free comparative backtest: Poisson engine vs Dixon-Coles vs league baseline.
+"""Leakage-free comparative backtest: Poisson vs Dixon-Coles vs Elo vs league baseline.
 
 For every evaluated match only matches played strictly before it are used.
 
-Dixon-Coles refitting is done in blocks to keep runtime reasonable: evaluated
-matches are grouped into consecutive blocks spanning at most ``refit_days``
-days; the model is fitted once per block on data strictly before the FIRST
-match of the block. Every match in a block is on/after that date, so no data
-from on/after a predicted match ever enters its prediction. (Because the time
-decay is exponential, measuring ages from the block start instead of the match
-date gives identical parameters; the only cost is that results inside the
-block's own window are not yet used — a slightly conservative choice.)
+Dixon-Coles and Elo refitting is done in blocks to keep runtime reasonable:
+evaluated matches are grouped into consecutive blocks spanning at most
+``refit_days`` days; the models are fitted once per block on data strictly
+before the FIRST match of the block.
 
 All models are scored on the SAME set of matches: if any model cannot predict a
 match (e.g. too little history), the match is skipped for all of them.
@@ -26,10 +22,11 @@ import pandas as pd
 import config
 from engine import analyze
 from models.dixon_coles import DixonColesModel
+from models.elo import EloModel
 from utils.data import prepare_history
 
 LOG_LOSS_EPS = 1e-15
-MODEL_NAMES = ("Poisson", "Dixon-Coles", "Βάση")
+MODEL_NAMES = ("Poisson", "Dixon-Coles", "Elo", "Βάση")
 
 
 def outcome_index(home_goals: int, away_goals: int) -> int:
@@ -68,6 +65,7 @@ class ComparisonResult:
     skip_reasons: dict[str, int]
     dc_refits: int
     dc_not_converged: int
+    elo_refits: int
     elapsed_seconds: float
     refit_days: int
     notes: list[str] = field(default_factory=list)
@@ -112,23 +110,33 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
 
     rows: list[dict] = []
     reasons: dict[str, int] = {}
-    refits = not_converged = 0
+    dc_refits = dc_not_converged = elo_refits = 0
 
     def skip(reason: str) -> None:
         reasons[reason] = reasons.get(reason, 0) + 1
 
     for block in _blocks(eval_df.date, int(refit_days)):
         block_start = eval_df.date.iloc[block[0]]
+
+        # --- Dixon-Coles (refit per block) ---
         dc = None
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 dc = DixonColesModel(**dc_kwargs).fit(df, reference_time=block_start)
-            refits += 1
+            dc_refits += 1
             if not dc.summary.converged:
-                not_converged += 1
+                dc_not_converged += 1
         except ValueError:
             dc = None
+
+        # --- Elo (refit per block) ---
+        elo = None
+        try:
+            elo = EloModel().fit(df, reference_time=block_start)
+            elo_refits += 1
+        except ValueError:
+            elo = None
 
         for pos in block:
             m = eval_df.iloc[pos]
@@ -136,10 +144,18 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
             if dc is None:
                 skip("Dixon-Coles: ανεπαρκή δεδομένα")
                 continue
+            if elo is None:
+                skip("Elo: ανεπαρκή δεδομένα")
+                continue
             try:
                 dc_pred = dc.predict(m.home_team, m.away_team)
             except ValueError:
                 skip("Dixon-Coles: ομάδα χωρίς προηγούμενους αγώνες")
+                continue
+            try:
+                elo_pred = elo.predict(m.home_team, m.away_team)
+            except ValueError:
+                skip("Elo: ομάδα χωρίς προηγούμενους αγώνες")
                 continue
             try:
                 po = analyze(past, m.home_team, m.away_team, m.date)
@@ -156,6 +172,8 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
                 "Poisson_over25": po["probabilities"]["Over 2.5"],
                 "Dixon-Coles": [dc_pred.probabilities[k] for k in ("1", "X", "2")],
                 "Dixon-Coles_over25": dc_pred.probabilities["Over 2.5"],
+                "Elo": [elo_pred.probabilities[k] for k in ("1", "X", "2")],
+                "Elo_over25": elo_pred.probabilities["Over 2.5"],
                 "Βάση": base.tolist(), "Βάση_over25": base_over,
             })
 
@@ -176,6 +194,7 @@ def compare_models(raw: pd.DataFrame, n_matches: int = config.BACKTEST_DEFAULT_M
         })
     return ComparisonResult(
         metrics=pd.DataFrame(metric_rows), predictions=preds, evaluated=len(preds), skipped=skipped,
-        skip_reasons=reasons, dc_refits=refits, dc_not_converged=not_converged,
+        skip_reasons=reasons, dc_refits=dc_refits, dc_not_converged=dc_not_converged,
+        elo_refits=elo_refits,
         elapsed_seconds=time.perf_counter() - started, refit_days=int(refit_days),
     )
