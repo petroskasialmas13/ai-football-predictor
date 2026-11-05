@@ -14,7 +14,8 @@ import streamlit as st
 
 import config
 from engine import analyze, clean_name, generate_demo, api_matches_to_history, prepare_history
-from data_provider import competitions, competition_matches, FootballAPIError
+from data_provider import (competitions, competition_matches, FootballAPIError, available_seasons,
+                           fetch_real_data, season_label, to_history)
 from models.monte_carlo import MonteCarloResult, analytical_probabilities, simulate_match
 from models.dixon_coles import RHO_BOUNDS, DixonColesModel
 from models.elo import EloModel
@@ -597,15 +598,57 @@ st.title("⚽ AI Football Predictor")
 st.write("Προσωπικός μηχανισμός ποδοσφαιρικών πιθανοτήτων — χωρίς ισχυρισμούς για «σίγουρα» σημεία.")
 with st.sidebar:
     st.header("Πηγή δεδομένων")
-    source = st.radio("Επιλογή", ["Football-data.org API · πραγματικά δεδομένα", "Demo · φανταστικά δεδομένα", "CSV · δικά μου ιστορικά"], label_visibility="collapsed")
+    source = st.radio("Επιλογή", ["Football-data.org API · πραγματικά δεδομένα", "Demo · φανταστικά δεδομένα", "CSV · δικά μου ιστορικά"], index=1, label_visibility="collapsed")
     st.caption("Το demo περιέχει **κατασκευασμένες ομάδες/αποτελέσματα** και ΔΕΝ είναι πραγματικά προγνωστικά.")
+
+    # --- Real data loader: past seasons from football-data.org v4 (cached 1 h on disk) ---
+    st.markdown("---")
+    st.markdown("### 📡 Πραγματικά Δεδομένα")
+    api_key = st.text_input("API Key (football-data.org)", type="password",
+                            placeholder="Αφήστε κενό για demo δεδομένα", key="real_data_api_key")
+    competition = st.selectbox("Πρωτάθλημα", list(config.FOOTBALL_DATA_COMPETITIONS.keys()), disabled=not api_key)
+    num_seasons = st.number_input("Αριθμός σεζόν", min_value=1, max_value=config.MAX_SEASONS, value=2,
+                                  disabled=not api_key)
+    load_btn = st.button("📥 Φόρτωση δεδομένων", disabled=not api_key)
+    if load_btn:
+        seasons = sorted(available_seasons(int(num_seasons)))
+        seasons_text = ", ".join(season_label(s) for s in seasons)
+        try:
+            with st.spinner("Φόρτωση δεδομένων από football-data.org..."):
+                loaded = fetch_real_data(api_key, config.FOOTBALL_DATA_COMPETITIONS[competition], seasons)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            if loaded.empty:
+                st.warning(f"Δεν βρέθηκαν ολοκληρωμένοι αγώνες για {competition} ({seasons_text}).")
+            else:
+                st.session_state["match_data"] = loaded
+                st.session_state["match_data_label"] = f"{competition} ({seasons_text})"
+    if "match_data" in st.session_state:
+        match_data = st.session_state["match_data"]
+        n_teams = len(set(match_data["HomeTeam"]) | set(match_data["AwayTeam"]))
+        st.info(f"✅ Φορτώθηκαν {len(match_data)} αγώνες, {n_teams} ομάδες – {st.session_state['match_data_label']}")
+        st.caption("Τα φορτωμένα δεδομένα έχουν προτεραιότητα έναντι της παραπάνω επιλογής πηγής.")
+        if st.button("✖ Αφαίρεση φορτωμένων δεδομένων"):
+            st.session_state.pop("match_data", None)
+            st.session_state.pop("match_data_label", None)
+            st.rerun()
+    elif not api_key and source.startswith("Demo"):
+        st.info(f"ℹ️ Χρησιμοποιούνται demo δεδομένα ({len(generate_demo()[0])} φανταστικοί αγώνες). "
+                "Για πραγματικά δεδομένα, εισάγετε API key από football-data.org.")
 
 history = pd.DataFrame()
 fixtures = []
 verified = False
 competition_label = ""
 try:
-    if source.startswith("Demo"):
+    if "match_data" in st.session_state:
+        # Loaded real data takes precedence; otherwise fall back to the selected source (Demo by default).
+        source = "football-data.org · φορτωμένα δεδομένα"
+        history = to_history(st.session_state["match_data"])
+        competition_label = f"football-data.org · {st.session_state['match_data_label']}"
+        verified = True
+    elif source.startswith("Demo"):
         history, fixtures = generate_demo()
         competition_label = "Φανταστικό πρωτάθλημα (Demo)"
         st.warning("🧪 **Demo:** Όλες οι ομάδες και οι βαθμολογίες εδώ είναι τεχνητές. Για πραγματικούς αγώνες διάλεξε API ή ανέβασε CSV.")

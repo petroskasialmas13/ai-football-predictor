@@ -19,6 +19,27 @@ FOOTBALL_DATA_TOKEN_ENV = "FOOTBALL_DATA_TOKEN"
 CACHE_TTL_COMPETITIONS = 3600
 CACHE_TTL_MATCHES = 900
 
+# --- football-data.org v4: real-data loader (data_provider.fetch_real_data) --
+FOOTBALL_DATA_API_URL = "https://api.football-data.org/v4"
+# Free-tier league competitions (display name -> API code). Champions League is
+# also free but is a cup format, so it is not offered for league modelling.
+FOOTBALL_DATA_COMPETITIONS = {
+    "Premier League": "PL",
+    "Bundesliga": "BL1",
+    "La Liga": "PD",
+    "Serie A": "SA",
+    "Ligue 1": "FL1",
+    "Eredivisie": "DED",
+    "Primeira Liga": "PPL",
+    "Championship": "ELC",
+}
+API_RATE_LIMIT_DELAY = 6.5        # seconds between requests (free tier: 10 requests/minute)
+API_MAX_RETRIES = 3               # retries after HTTP 429
+API_RETRY_MAX_WAIT = 65.0         # cap (seconds) for a single 429 back-off
+MAX_SEASONS = 3                   # past seasons offered for model training
+REAL_DATA_CACHE_DIR = "~/.cache/football_ai"
+REAL_DATA_CACHE_TTL = 3600        # seconds
+
 # --- Poisson / team-strength model ----------------------------------------
 POISSON_MAX_GOALS = 12            # score grid is 0..12 for each team (normalized)
 RECENCY_MAX_GAMES = 12            # most recent matches used per team
