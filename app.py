@@ -11,8 +11,10 @@ import re
 import pandas as pd
 import streamlit as st
 
+import config
 from engine import analyze, backtest, clean_name, generate_demo, api_matches_to_history, prepare_history
 from data_provider import competitions, competition_matches, FootballAPIError
+from models.monte_carlo import MonteCarloResult, analytical_probabilities, simulate_match
 
 ATHENS = ZoneInfo("Europe/Athens")
 
@@ -95,6 +97,139 @@ def read_batch(input_text: str, names: list[str]) -> tuple[list[tuple[str, str]]
     return list(dict.fromkeys(pairs)), errors
 
 
+@st.cache_data(max_entries=32, show_spinner=False)
+def cached_simulation(lambda_home: float, lambda_away: float, n_simulations: int, seed: int) -> MonteCarloResult:
+    # Pure NumPy simulation (no API calls); fixed seed -> identical output for identical inputs.
+    return simulate_match(lambda_home, lambda_away, n_simulations=n_simulations, seed=seed)
+
+
+def greek_int(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
+
+
+MC_COMPARISON_MARKETS = ("1", "X", "2", "1X", "X2", "12",
+                         "Over 0.5", "Under 0.5", "Over 1.5", "Under 1.5", "Over 2.5", "Under 2.5",
+                         "Over 3.5", "Under 3.5", "Over 4.5", "Under 4.5", "GG", "NG")
+MC_HALFTIME_MARKETS = {"HT 1": "Ημίχρονο 1", "HT X": "Ημίχρονο X", "HT 2": "Ημίχρονο 2",
+                       "HT Over 0.5": "Over 0.5 στο 1ο ημίχρονο", "HT Over 1.5": "Over 1.5 στο 1ο ημίχρονο",
+                       "2H Over 0.5": "Over 0.5 στο 2ο ημίχρονο", "2H Over 1.5": "Over 1.5 στο 2ο ημίχρονο"}
+MC_CI_MARKETS = ("1", "X", "2", "Over 2.5", "Under 2.5", "GG", "NG")
+
+
+def mc_comparison_table(poisson: dict, analytic: dict, mc: MonteCarloResult) -> pd.DataFrame:
+    """Analytical Poisson vs simulated probabilities.
+
+    Uses the engine's Poisson values where the engine provides them (same numbers as the other tabs),
+    otherwise the closed-form values for the same λ and assumptions (Over/Under 0.5 and 4.5).
+    """
+    rows = []
+    for market in MC_COMPARISON_MARKETS:
+        exact = poisson.get(market, analytic.get(market))
+        sim = mc.probabilities.get(market)
+        if exact is None or sim is None:
+            continue
+        lo, hi = mc.intervals[market]
+        rows.append({"Αγορά": market, "Poisson (αναλυτικά)": f"{exact:.2%}", "Monte Carlo": f"{sim:.2%}",
+                     "Διαφορά (π.μ.)": f"{100 * (sim - exact):+.2f}",
+                     "Poisson εντός διαστήματος;": "✅ Ναι" if lo <= exact <= hi else "⚠️ Όχι"})
+    return pd.DataFrame(rows)
+
+
+def _heat_color(value: float, vmax: float) -> str:
+    # Manual white → green gradient, so no extra plotting dependency is needed.
+    t = 0.0 if vmax <= 0 else min(max(value / vmax, 0.0), 1.0)
+    r, g, b = (int(255 + (c - 255) * t) for c in (22, 101, 52))
+    text = "#ffffff" if t > 0.55 else "#0f172a"
+    return f"background-color: rgb({r},{g},{b}); color: {text}"
+
+
+def score_heatmap(mc: MonteCarloResult):
+    size = mc.score_matrix.shape[0]
+    frame = pd.DataFrame(mc.score_matrix * 100,
+                         index=[f"Γηπεδούχος {i}" for i in range(size)],
+                         columns=[f"Φιλοξ. {j}" for j in range(size)])
+    vmax = float(frame.values.max())
+    styler = frame.style
+    mapper = getattr(styler, "map", None) or styler.applymap  # pandas < 2.1 fallback
+    return mapper(lambda v: _heat_color(v, vmax)).format("{:.2f}%")
+
+
+def monte_carlo_tab(result: dict) -> None:
+    p = result["probabilities"]
+    lh, la = float(result["expected_home"]), float(result["expected_away"])
+    st.caption("Μαθηματικές προσομοιώσεις με NumPy πάνω στα ίδια αναμενόμενα γκολ (λ) του μοντέλου Poisson. "
+               "Δεν γίνονται κλήσεις API και δεν προστίθεται νέα πληροφορία για τις ομάδες· η προσομοίωση "
+               "επαληθεύει τις αναλυτικές πιθανότητες και προσθέτει ημίχρονα και διαστήματα εμπιστοσύνης.")
+    n_sims = st.slider("Αριθμός προσομοιώσεων", min_value=config.MC_MIN_SIMULATIONS,
+                       max_value=config.MC_MAX_SIMULATIONS, value=config.MC_DEFAULT_SIMULATIONS,
+                       step=config.MC_SIMULATION_STEP, format="%d",
+                       key=f"mc_sims_{result['home']}_{result['away']}")
+    seed = config.DEFAULT_RANDOM_SEED
+    try:
+        with st.spinner(f"Εκτέλεση {greek_int(int(n_sims))} προσομοιώσεων..."):
+            mc = cached_simulation(round(lh, 6), round(la, 6), int(n_sims), seed)
+            analytic = analytical_probabilities(lh, la)
+    except ValueError as exc:
+        st.error(f"Η προσομοίωση δεν ολοκληρώθηκε: {exc}")
+        return
+
+    conf = f"{mc.confidence:.0%}"
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Προσομοιώσεις", greek_int(mc.n_simulations))
+    m2.metric("Μ.Ο. γκολ γηπεδούχου (προσομ.)", f"{mc.mean_home_goals:.2f}", help=f"λ μοντέλου: {lh:.2f}")
+    m3.metric("Μ.Ο. γκολ φιλοξενούμενου (προσομ.)", f"{mc.mean_away_goals:.2f}", help=f"λ μοντέλου: {la:.2f}")
+    m4.metric("Χρόνος υπολογισμού", f"{mc.elapsed_seconds:.2f} δευτ.")
+    st.caption(f"Σταθερό seed τυχαιότητας: {seed} (ίδια δεδομένα → ίδια αποτελέσματα). "
+               f"Επίπεδο εμπιστοσύνης: {conf} (διάστημα Wilson).")
+
+    st.markdown("**Σύγκριση: αναλυτικό Poisson έναντι Monte Carlo**")
+    st.dataframe(mc_comparison_table(p, analytic, mc), hide_index=True, use_container_width=True)
+    st.caption("π.μ. = ποσοστιαίες μονάδες. Μικρές διαφορές είναι αναμενόμενος στατιστικός θόρυβος και "
+               "μειώνονται όσο αυξάνονται οι προσομοιώσεις. Ένα «⚠️ Όχι» μπορεί να εμφανιστεί τυχαία "
+               f"(περίπου στο {1 - mc.confidence:.0%} των αγορών) και δεν σημαίνει σφάλμα του μοντέλου.")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**10 πιθανότερα ακριβή σκορ (Monte Carlo)**")
+        st.dataframe(pd.DataFrame([{"Σκορ": s["score"], "Πιθανότητα": f"{s['probability']:.2%}",
+                                    f"Διάστημα {conf}": f"{s['ci_low']:.2%} – {s['ci_high']:.2%}"}
+                                   for s in mc.top_scores]), hide_index=True, use_container_width=True)
+    with right:
+        st.markdown(f"**Διαστήματα εμπιστοσύνης {conf} για βασικές αγορές**")
+        st.dataframe(pd.DataFrame([{"Αγορά": k, "Monte Carlo": f"{mc.probabilities[k]:.2%}",
+                                    "Κάτω όριο": f"{mc.intervals[k][0]:.2%}",
+                                    "Άνω όριο": f"{mc.intervals[k][1]:.2%}",
+                                    "Εύρος (π.μ.)": f"{100 * (mc.intervals[k][1] - mc.intervals[k][0]):.2f}"}
+                                   for k in MC_CI_MARKETS]), hide_index=True, use_container_width=True)
+        tg = mc.total_goals_summary
+        st.caption(f"Σύνολο γκολ: μέσος όρος {tg['mean']:.2f} (διάστημα {conf}: {tg['mean_ci_low']:.2f} – "
+                   f"{tg['mean_ci_high']:.2f}), διάμεσος {tg['median']:.0f}, το 90% των προσομοιώσεων "
+                   f"έχει από {tg['p05']:.0f} έως {tg['p95']:.0f} γκολ.")
+    st.caption("Τα διαστήματα εμπιστοσύνης μετρούν μόνο τον θόρυβο της προσομοίωσης, όχι το σφάλμα "
+               "του μοντέλου ή των δεδομένων.")
+
+    st.markdown("**Χάρτης θερμότητας ακριβούς σκορ** (γραμμές: γκολ γηπεδούχου · στήλες: γκολ φιλοξενούμενου)")
+    st.dataframe(score_heatmap(mc), use_container_width=True)
+    st.caption(f"Σκορ εκτός πίνακα (πάνω από {mc.score_matrix.shape[0] - 1} γκολ για μία ομάδα): "
+               f"{mc.score_matrix_other:.2%} των προσομοιώσεων.")
+
+    st.markdown("**Ημίχρονο**")
+    h1, h2 = st.columns(2)
+    with h1:
+        st.dataframe(pd.DataFrame([{"Αγορά": label, "Poisson (αναλυτικά)": f"{analytic[k]:.2%}",
+                                    "Monte Carlo": f"{mc.probabilities[k]:.2%}",
+                                    f"Διάστημα {conf}": f"{mc.intervals[k][0]:.2%} – {mc.intervals[k][1]:.2%}"}
+                                   for k, label in MC_HALFTIME_MARKETS.items()]),
+                     hide_index=True, use_container_width=True)
+    with h2:
+        htft = sorted(mc.halftime_fulltime.items(), key=lambda kv: kv[1], reverse=True)
+        st.dataframe(pd.DataFrame([{"Ημίχρονο/Τελικό": k, "Πιθανότητα": f"{v:.2%}"} for k, v in htft]),
+                     hide_index=True, use_container_width=True)
+    st.warning(f"Παραδοχή μοντέλου (όχι μετρημένο στατιστικό): κάθε γκολ πέφτει στο 1ο ημίχρονο με πιθανότητα "
+               f"{mc.first_half_share:.0%}, ανεξάρτητα από τα υπόλοιπα. Οι αγορές ημιχρόνου χρειάζονται "
+               "βαθμονόμηση με πραγματικά δεδομένα ημιχρόνων πριν θεωρηθούν αξιόπιστες.")
+
+
 def scorecard(result: dict) -> None:
     p = result["probabilities"]
     st.subheader(f"{result['home']}  —  {result['away']}")
@@ -110,7 +245,7 @@ def scorecard(result: dict) -> None:
     c3.metric("Over 2.5", f"{p['Over 2.5']:.1%}")
     c4.metric("GG", f"{p['GG']:.1%}")
 
-    tab1, tab2, tab3 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Σύγκριση αποδόσεων"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Σύγκριση αποδόσεων", "Monte Carlo"])
     with tab1:
         rows = []
         markets = ["1", "X", "2", "1X", "X2", "12", "Over 1.5", "Under 1.5", "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", "GG", "NG"]
@@ -158,6 +293,8 @@ def scorecard(result: dict) -> None:
                        "τα σφάλματα πιθανοτήτων μπορούν να ανατρέψουν πλήρως το συμπέρασμα.")
         else:
             st.info("Βάλε τουλάχιστον μία απόδοση ≥ 1.01 για να δεις τη σύγκριση.")
+    with tab4:
+        monte_carlo_tab(result)
 
 
 st.title("⚽ AI Football Predictor")
