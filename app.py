@@ -17,6 +17,7 @@ from engine import analyze, clean_name, generate_demo, api_matches_to_history, p
 from data_provider import competitions, competition_matches, FootballAPIError
 from models.monte_carlo import MonteCarloResult, analytical_probabilities, simulate_match
 from models.dixon_coles import RHO_BOUNDS, DixonColesModel
+from models.elo import EloModel
 from backtesting.compare import compare_models
 import warnings
 import numpy as np
@@ -129,6 +130,25 @@ def add_dixon_coles(result: dict, history_df: pd.DataFrame) -> dict:
     except ValueError as exc:
         result.pop("dixon_coles", None)
         result["dixon_coles_error"] = str(exc)
+    return result
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_elo(history_df: pd.DataFrame, cutoff_iso: str) -> EloModel:
+    return EloModel().fit(history_df, reference_time=pd.Timestamp(cutoff_iso))
+
+
+def add_elo(result: dict, history_df: pd.DataFrame) -> dict:
+    """Attach an Elo prediction (or a Greek error message) to the result dict."""
+    try:
+        model = cached_elo(history_df, pd.Timestamp(result["kickoff"]).isoformat())
+        pred = model.predict(result["home"], result["away"])
+        result["elo"] = {"prediction": pred, "summary": model.summary,
+                         "ratings_table": model.team_ratings_table()}
+        result.pop("elo_error", None)
+    except ValueError as exc:
+        result.pop("elo", None)
+        result["elo_error"] = str(exc)
     return result
 
 
@@ -341,6 +361,75 @@ def dixon_coles_tab(result: dict) -> None:
         st.warning(f"Ο αλγόριθμος εκτίμησης δεν συνέκλινε πλήρως ({summary.message}). Αντιμετώπισε τα αποτελέσματα με επιφύλαξη.")
 
 
+def elo_tab(result: dict) -> None:
+    """Show the Elo ratings tab inside the match scorecard."""
+    if "elo_error" in result:
+        st.warning(f"Δεν ήταν δυνατός ο υπολογισμός Elo: {result['elo_error']}")
+        return
+    if "elo" not in result:
+        st.info("Πάτησε «Ανάλυση αγώνα» για να υπολογιστεί το Elo.")
+        return
+
+    elo = result["elo"]
+    pred = elo["prediction"]
+    summary = elo["summary"]
+
+    st.markdown(f"**{pred.home}** (Elo {pred.home_rating:.0f})  vs  **{pred.away}** (Elo {pred.away_rating:.0f})")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("1 · Γηπεδούχος", f"{pred.home_win_prob:.1%}")
+    m2.metric("X · Ισοπαλία", f"{pred.draw_prob:.1%}")
+    m3.metric("2 · Φιλοξενούμενος", f"{pred.away_win_prob:.1%}")
+    m4.metric("Over 2.5", f"{pred.probabilities['Over 2.5']:.1%}")
+
+    # Comparison table: Poisson vs Dixon-Coles vs Elo
+    p_poisson = result["probabilities"]
+    dc_probs = result.get("dixon_coles", {}).get("prediction", None)
+    markets = ["1", "X", "2", "Over 2.5", "GG"]
+    rows = []
+    for m in markets:
+        row = {"Αγορά": m, "Poisson": f"{p_poisson[m]:.1%}", "Elo": f"{pred.probabilities[m]:.1%}"}
+        if dc_probs is not None:
+            row["Dixon-Coles"] = f"{dc_probs.probabilities[m]:.1%}"
+        fair = pred.probabilities[m]
+        row["Δίκαιη απόδοση Elo"] = f"{1/fair:.2f}" if fair > 0.005 else "—"
+        rows.append(row)
+    col_order = ["Αγορά", "Poisson"]
+    if dc_probs is not None:
+        col_order.append("Dixon-Coles")
+    col_order += ["Elo", "Δίκαιη απόδοση Elo"]
+    st.dataframe(pd.DataFrame(rows)[col_order], hide_index=True, use_container_width=True)
+
+    # Ratings table (top 10 + both teams)
+    ratings_df = elo["ratings_table"]
+    if not ratings_df.empty:
+        with st.expander("Κατάταξη ομάδων κατά Elo"):
+            st.dataframe(ratings_df, hide_index=True, use_container_width=True)
+
+    st.markdown("**Τι είναι το Elo**")
+    st.write(
+        "Κάθε ομάδα ξεκινά με βαθμολογία 1500. Μετά από κάθε αγώνα, "
+        "ο νικητής κερδίζει πόντους και ο ηττημένος χάνει. Όσο πιο αναπάντεχο "
+        "ένα αποτέλεσμα (π.χ. ο τελευταίος νικάει τον πρώτο), τόσο μεγαλύτερη η αλλαγή."
+    )
+    rating_diff = pred.home_rating - pred.away_rating
+    if abs(rating_diff) < 30:
+        verdict = "Οι δύο ομάδες είναι σχεδόν ισοδύναμες κατά το Elo."
+    elif rating_diff > 0:
+        verdict = f"Ο γηπεδούχος υπερτερεί κατά {rating_diff:.0f} πόντους Elo."
+    else:
+        verdict = f"Ο φιλοξενούμενος υπερτερεί κατά {-rating_diff:.0f} πόντους Elo."
+    st.write(f"- {verdict}")
+    st.write(f"- Πλεονέκτημα έδρας: +{summary.hfa:.0f} πόντους (Elo δίνει αυτόματα πλεονέκτημα στον γηπεδούχο).")
+    st.write(f"- K-factor = {summary.k_factor:.0f}: πόσο γρήγορα αλλάζει η βαθμολογία μετά από κάθε αγώνα. "
+             "Υψηλό K = γρήγορη αντίδραση αλλά πιο «νευρικές» βαθμολογίες.")
+
+    st.caption(
+        f"Εκπαίδευση σε {summary.n_matches} αγώνες ({summary.first_match:%d/%m/%Y} – {summary.last_match:%d/%m/%Y}), "
+        f"{summary.n_teams} ομάδες. Μέση βαθμολογία {summary.mean_rating:.0f} ± {summary.std_rating:.0f}. "
+        "Οι πιθανότητες Over 2.5 και GG είναι αδρές εκτιμήσεις — για ακριβέστερες χρησιμοποίησε το Poisson ή το Dixon-Coles."
+    )
+
+
 def scorecard(result: dict) -> None:
     p = result["probabilities"]
     st.subheader(f"{result['home']}  —  {result['away']}")
@@ -356,7 +445,7 @@ def scorecard(result: dict) -> None:
     c3.metric("Over 2.5", f"{p['Over 2.5']:.1%}")
     c4.metric("GG", f"{p['GG']:.1%}")
 
-    tab1, tab2, tab_dc, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Dixon-Coles", "Σύγκριση αποδόσεων", "Monte Carlo"])
+    tab1, tab2, tab_dc, tab_elo, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Dixon-Coles", "Elo", "Σύγκριση αποδόσεων", "Monte Carlo"])
     with tab1:
         rows = []
         markets = ["1", "X", "2", "1X", "X2", "12", "Over 1.5", "Under 1.5", "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", "GG", "NG"]
@@ -406,6 +495,8 @@ def scorecard(result: dict) -> None:
             st.info("Βάλε τουλάχιστον μία απόδοση ≥ 1.01 για να δεις τη σύγκριση.")
     with tab_dc:
         dixon_coles_tab(result)
+    with tab_elo:
+        elo_tab(result)
     with tab4:
         monte_carlo_tab(result)
 
@@ -493,7 +584,7 @@ else:
 
 if st.button("🔎 Ανάλυση αγώνα", type="primary", use_container_width=True):
     try:
-        st.session_state["prediction"] = add_dixon_coles(analyze(history, home, away, kickoff), history)
+        st.session_state["prediction"] = add_elo(add_dixon_coles(analyze(history, home, away, kickoff), history), history)
         st.session_state["prediction_key"] = (source, competition_label, home, away, str(pd.Timestamp(kickoff)))
     except ValueError as exc:
         st.session_state.pop("prediction", None)
@@ -543,8 +634,8 @@ if "batch_result" in st.session_state and st.session_state.get("batch_key") == (
 st.divider()
 st.header("3. Έλεγχος μοντέλου σε παλιούς αγώνες")
 st.write("Το backtest ελέγχει τις εκτιμήσεις μόνο με πληροφορίες που ήταν γνωστές πριν από κάθε αγώνα. "
-         "Συγκρίνει **τρία μοντέλα στους ίδιους ακριβώς αγώνες**: Poisson (το βασικό μοντέλο της εφαρμογής), "
-         "Dixon-Coles και μια απλή «Βάση» (ιστορικές συχνότητες 1/Χ/2 του πρωταθλήματος).")
+         "Συγκρίνει **τέσσερα μοντέλα στους ίδιους ακριβώς αγώνες**: Poisson, Dixon-Coles, Elo "
+         "και μια απλή «Βάση» (ιστορικές συχνότητες 1/Χ/2 του πρωταθλήματος).")
 bt_matches = st.slider("Πόσοι από τους πιο πρόσφατους αγώνες θα ελεγχθούν", min_value=30, max_value=200,
                        value=config.BACKTEST_DEFAULT_MATCHES, step=10)
 BT_REFIT_DAYS = 7
@@ -570,7 +661,7 @@ if "comparison" in st.session_state and st.session_state.get("comparison_key") =
     q1, q2, q3, q4 = st.columns(4)
     q1.metric("Αγώνες που ελέγχθηκαν", cmp_res.evaluated)
     q2.metric("Αγώνες που παραλείφθηκαν", cmp_res.skipped)
-    q3.metric("Εκπαιδεύσεις Dixon-Coles", cmp_res.dc_refits)
+    q3.metric("Εκπαιδεύσεις DC / Elo", f"{cmp_res.dc_refits} / {cmp_res.elo_refits}")
     q4.metric("Χρόνος εκτέλεσης", f"{cmp_res.elapsed_seconds:.1f} δευτ.")
     if cmp_res.skip_reasons:
         st.caption("Λόγοι παράλειψης: " + " · ".join(f"{reason}: {count}" for reason, count in cmp_res.skip_reasons.items()))
@@ -600,7 +691,8 @@ with st.expander("Μεθοδολογία και όρια"):
     - **Poisson:** υπολογίζονται όλες οι βασικές πιθανότητες από την κατανομή πιθανών σκορ.
     - **Dixon-Coles:** δεύτερο, ανεξάρτητο μοντέλο με επίθεση/άμυνα ανά ομάδα, κοινό πλεονέκτημα έδρας, χρονική απόσβεση (πιο πρόσφατα ματς μετράνε περισσότερο) και διόρθωση ρ για τα χαμηλά σκορ (0-0, 1-0, 0-1, 1-1). Η τιμή απόσβεσης ξ είναι προεπιλογή από τη βιβλιογραφία, δεν έχει ρυθμιστεί ακόμη στα δικά σου δεδομένα.
     - **Monte Carlo:** προσομοιώνει χιλιάδες αγώνες είτε με τα αναμενόμενα γκολ του Poisson είτε με τον πίνακα σκορ του Dixon-Coles.
-    - **Συγκριτικό backtest:** Poisson, Dixon-Coles και απλή βάση στους ίδιους αγώνες, μόνο με πληροφορίες πριν από κάθε αγώνα (Brier, log loss, ακρίβεια).
+    - **Elo:** σύστημα βαθμολογίας δύναμης ανά ομάδα. Σταθερό ακόμα και με λίγα δεδομένα, αλλά δεν μοντελοποιεί αριθμό γκολ — οι αγορές Over/GG είναι αδρές εκτιμήσεις.
+    - **Συγκριτικό backtest:** Poisson, Dixon-Coles, Elo και απλή βάση στους ίδιους αγώνες, μόνο με πληροφορίες πριν από κάθε αγώνα (Brier, log loss, ακρίβεια).
     - **Αβεβαιότητα:** μικρό δείγμα, αλλαγές προπονητή, μεταγραφές, απουσίες, πρόγραμμα και ισχύς αντιπάλων δεν μοντελοποιούνται πλήρως.
     - **Αποδόσεις:** χωρίς αυτόματη λήψη στοιχηματικών αποδόσεων· μπορείς να καταχωρίσεις δικές σου για ενδεικτικό EV.
     - **Πρόκειται για στατιστικό baseline, όχι για εκπαιδευμένο βαθύ νευρωνικό δίκτυο ή αυτόματο LLM.** Απαιτεί αναβαθμίσεις, περισσότερα δεδομένα και calibration πριν θεωρηθεί αξιόπιστο παραγωγικό betting model.

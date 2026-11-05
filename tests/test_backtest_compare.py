@@ -87,10 +87,10 @@ def test_blocks_respect_window():
 # ---------------------------------------------------------------- comparison
 def test_comparison_same_match_set(comparison):
     m = comparison.metrics
-    assert list(m["Μοντέλο"]) == ["Poisson", "Dixon-Coles", "Βάση"]
+    assert list(m["Μοντέλο"]) == ["Poisson", "Dixon-Coles", "Elo", "Βάση"]
     assert (m["Αγώνες"] == comparison.evaluated).all()
     assert comparison.evaluated + comparison.skipped == 40
-    for name in ("Poisson", "Dixon-Coles", "Βάση"):
+    for name in ("Poisson", "Dixon-Coles", "Elo", "Βάση"):
         probs = np.vstack(comparison.predictions[name].to_numpy())
         assert probs.shape == (comparison.evaluated, 3)
         assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-9)
