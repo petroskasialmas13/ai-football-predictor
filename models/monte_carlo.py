@@ -92,14 +92,31 @@ def simulate_match(
     top_n: int = config.MC_TOP_SCORES,
     heatmap_max_goals: int = config.MC_HEATMAP_MAX_GOALS,
     over_under_lines: tuple[float, ...] = config.OVER_UNDER_LINES,
+    score_matrix: np.ndarray | None = None,
 ) -> MonteCarloResult:
     """Run ``n_simulations`` independent match simulations.
 
     Pass a fixed ``seed`` for reproducible results (same inputs + same seed ->
     identical output). ``seed=None`` draws fresh OS entropy.
+
+    ``score_matrix`` (optional): a full-time score distribution P(home=i, away=j)
+    (e.g. the tau-corrected Dixon-Coles matrix). When given, final scores are
+    sampled directly from it instead of from two independent Poissons, so any
+    dependence encoded in the matrix (such as the Dixon-Coles low-score
+    correction) is preserved. ``lambda_home``/``lambda_away`` are then only
+    recorded for reference.
     """
     lh = _validate_lambda("lambda_home", lambda_home)
     la = _validate_lambda("lambda_away", lambda_away)
+    flat_p = None
+    if score_matrix is not None:
+        m = np.asarray(score_matrix, dtype=float)
+        if m.ndim != 2 or m.size == 0 or not np.isfinite(m).all() or (m < 0).any() or m.sum() <= 0:
+            raise ValueError("Μη έγκυρος πίνακας πιθανοτήτων σκορ για την προσομοίωση.")
+        if abs(m.sum() - 1.0) > 1e-6:
+            raise ValueError(f"Ο πίνακας πιθανοτήτων σκορ πρέπει να αθροίζει σε 1 (άθροισμα {m.sum():.6f}).")
+        flat_p = (m / m.sum()).ravel()
+        matrix_cols = m.shape[1]
     n = int(n_simulations)
     if not config.MC_MIN_SIMULATIONS <= n <= config.MC_MAX_SIMULATIONS:
         raise ValueError(f"Οι προσομοιώσεις πρέπει να είναι από {config.MC_MIN_SIMULATIONS:,} "
@@ -111,8 +128,13 @@ def simulate_match(
     started = time.perf_counter()
     rng = np.random.default_rng(seed)
     # Draw order is fixed so a given seed always reproduces the same match set.
-    home = rng.poisson(lh, n).astype(np.int32)
-    away = rng.poisson(la, n).astype(np.int32)
+    if flat_p is None:
+        home = rng.poisson(lh, n).astype(np.int32)
+        away = rng.poisson(la, n).astype(np.int32)
+    else:
+        idx = rng.choice(flat_p.size, size=n, p=flat_p)
+        home = (idx // matrix_cols).astype(np.int32)
+        away = (idx % matrix_cols).astype(np.int32)
     ht_home = rng.binomial(home, first_half_share).astype(np.int32)
     ht_away = rng.binomial(away, first_half_share).astype(np.int32)
     total = home + away
@@ -188,6 +210,7 @@ def simulate_match(
         halftime_fulltime=halftime_fulltime, total_goals_distribution=total_goals_distribution,
         total_goals_summary=total_goals_summary, mean_home_goals=float(home.mean()),
         mean_away_goals=float(away.mean()), elapsed_seconds=elapsed,
+        extra={"sampling": "poisson" if flat_p is None else "score_matrix"},
     )
 
 

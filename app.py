@@ -5,6 +5,7 @@ from datetime import datetime, date, time, timedelta
 from difflib import get_close_matches
 from io import BytesIO
 from zoneinfo import ZoneInfo
+import math
 import os
 import re
 
@@ -12,9 +13,13 @@ import pandas as pd
 import streamlit as st
 
 import config
-from engine import analyze, backtest, clean_name, generate_demo, api_matches_to_history, prepare_history
+from engine import analyze, clean_name, generate_demo, api_matches_to_history, prepare_history
 from data_provider import competitions, competition_matches, FootballAPIError
 from models.monte_carlo import MonteCarloResult, analytical_probabilities, simulate_match
+from models.dixon_coles import RHO_BOUNDS, DixonColesModel
+from backtesting.compare import compare_models
+import warnings
+import numpy as np
 
 ATHENS = ZoneInfo("Europe/Athens")
 
@@ -98,9 +103,33 @@ def read_batch(input_text: str, names: list[str]) -> tuple[list[tuple[str, str]]
 
 
 @st.cache_data(max_entries=32, show_spinner=False)
-def cached_simulation(lambda_home: float, lambda_away: float, n_simulations: int, seed: int) -> MonteCarloResult:
+def cached_simulation(lambda_home: float, lambda_away: float, n_simulations: int, seed: int,
+                      score_matrix: np.ndarray | None = None) -> MonteCarloResult:
     # Pure NumPy simulation (no API calls); fixed seed -> identical output for identical inputs.
-    return simulate_match(lambda_home, lambda_away, n_simulations=n_simulations, seed=seed)
+    return simulate_match(lambda_home, lambda_away, n_simulations=n_simulations, seed=seed,
+                          score_matrix=score_matrix)
+
+
+@st.cache_data(max_entries=16, show_spinner=False)
+def cached_dixon_coles(history_df: pd.DataFrame, cutoff_iso: str) -> DixonColesModel:
+    # Fitted only on matches strictly before the kickoff (enforced inside fit()).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # convergence is reported via summary.converged
+        return DixonColesModel().fit(history_df, reference_time=pd.Timestamp(cutoff_iso))
+
+
+def add_dixon_coles(result: dict, history_df: pd.DataFrame) -> dict:
+    """Attach a Dixon-Coles prediction (or a Greek error message) to a Poisson result dict."""
+    try:
+        model = cached_dixon_coles(history_df, pd.Timestamp(result["kickoff"]).isoformat())
+        result["dixon_coles"] = {"prediction": model.predict(result["home"], result["away"]),
+                                 "summary": model.summary, "home_advantage": model.home_advantage,
+                                 "rho": model.rho}
+        result.pop("dixon_coles_error", None)
+    except ValueError as exc:
+        result.pop("dixon_coles", None)
+        result["dixon_coles_error"] = str(exc)
+    return result
 
 
 def greek_int(value: int) -> str:
@@ -116,7 +145,8 @@ MC_HALFTIME_MARKETS = {"HT 1": "Ημίχρονο 1", "HT X": "Ημίχρονο X
 MC_CI_MARKETS = ("1", "X", "2", "Over 2.5", "Under 2.5", "GG", "NG")
 
 
-def mc_comparison_table(poisson: dict, analytic: dict, mc: MonteCarloResult) -> pd.DataFrame:
+def mc_comparison_table(poisson: dict, analytic: dict, mc: MonteCarloResult,
+                        exact_label: str = "Poisson (αναλυτικά)") -> pd.DataFrame:
     """Analytical Poisson vs simulated probabilities.
 
     Uses the engine's Poisson values where the engine provides them (same numbers as the other tabs),
@@ -129,9 +159,9 @@ def mc_comparison_table(poisson: dict, analytic: dict, mc: MonteCarloResult) -> 
         if exact is None or sim is None:
             continue
         lo, hi = mc.intervals[market]
-        rows.append({"Αγορά": market, "Poisson (αναλυτικά)": f"{exact:.2%}", "Monte Carlo": f"{sim:.2%}",
+        rows.append({"Αγορά": market, exact_label: f"{exact:.2%}", "Monte Carlo": f"{sim:.2%}",
                      "Διαφορά (π.μ.)": f"{100 * (sim - exact):+.2f}",
-                     "Poisson εντός διαστήματος;": "✅ Ναι" if lo <= exact <= hi else "⚠️ Όχι"})
+                     "Αναλυτική τιμή εντός διαστήματος;": "✅ Ναι" if lo <= exact <= hi else "⚠️ Όχι"})
     return pd.DataFrame(rows)
 
 
@@ -155,11 +185,29 @@ def score_heatmap(mc: MonteCarloResult):
 
 
 def monte_carlo_tab(result: dict) -> None:
-    p = result["probabilities"]
-    lh, la = float(result["expected_home"]), float(result["expected_away"])
-    st.caption("Μαθηματικές προσομοιώσεις με NumPy πάνω στα ίδια αναμενόμενα γκολ (λ) του μοντέλου Poisson. "
-               "Δεν γίνονται κλήσεις API και δεν προστίθεται νέα πληροφορία για τις ομάδες· η προσομοίωση "
-               "επαληθεύει τις αναλυτικές πιθανότητες και προσθέτει ημίχρονα και διαστήματα εμπιστοσύνης.")
+    dc = result.get("dixon_coles")
+    options = ["Poisson", "Dixon-Coles"] if dc else ["Poisson"]
+    source = st.radio("Πηγή αναμενόμενων γκολ", options, horizontal=True,
+                      key=f"mc_source_{result['home']}_{result['away']}")
+    if not dc:
+        st.caption("Το Dixon-Coles δεν είναι διαθέσιμο για αυτόν τον αγώνα (δες την καρτέλα «Dixon-Coles»).")
+    matrix = None
+    if source == "Dixon-Coles":
+        pred = dc["prediction"]
+        p = pred.probabilities
+        lh, la = float(pred.lambda_home), float(pred.lambda_away)
+        matrix = pred.matrix
+        exact_label = "Dixon-Coles (αναλυτικά)"
+        st.caption("Μαθηματικές προσομοιώσεις με NumPy. Κάθε προσομοιωμένο τελικό σκορ κληρώνεται απευθείας από "
+                   "τον πίνακα σκορ του Dixon-Coles, οπότε η διόρθωση για τα χαμηλά σκορ (0-0, 1-0, 0-1, 1-1) "
+                   "διατηρείται. Δεν γίνονται κλήσεις API.")
+    else:
+        p = result["probabilities"]
+        lh, la = float(result["expected_home"]), float(result["expected_away"])
+        exact_label = "Poisson (αναλυτικά)"
+        st.caption("Μαθηματικές προσομοιώσεις με NumPy πάνω στα ίδια αναμενόμενα γκολ (λ) του μοντέλου Poisson. "
+                   "Δεν γίνονται κλήσεις API και δεν προστίθεται νέα πληροφορία για τις ομάδες· η προσομοίωση "
+                   "επαληθεύει τις αναλυτικές πιθανότητες και προσθέτει ημίχρονα και διαστήματα εμπιστοσύνης.")
     n_sims = st.slider("Αριθμός προσομοιώσεων", min_value=config.MC_MIN_SIMULATIONS,
                        max_value=config.MC_MAX_SIMULATIONS, value=config.MC_DEFAULT_SIMULATIONS,
                        step=config.MC_SIMULATION_STEP, format="%d",
@@ -167,8 +215,12 @@ def monte_carlo_tab(result: dict) -> None:
     seed = config.DEFAULT_RANDOM_SEED
     try:
         with st.spinner(f"Εκτέλεση {greek_int(int(n_sims))} προσομοιώσεων..."):
-            mc = cached_simulation(round(lh, 6), round(la, 6), int(n_sims), seed)
+            mc = cached_simulation(round(lh, 6), round(la, 6), int(n_sims), seed, matrix)
             analytic = analytical_probabilities(lh, la)
+            if matrix is not None:
+                # Full-time exact values come from the DC matrix; analytic Poisson half-time values
+                # do not include the tau correction, so they are not shown as "exact" for DC.
+                analytic = {k: v for k, v in analytic.items() if not k.startswith(("HT", "2H"))}
     except ValueError as exc:
         st.error(f"Η προσομοίωση δεν ολοκληρώθηκε: {exc}")
         return
@@ -182,8 +234,8 @@ def monte_carlo_tab(result: dict) -> None:
     st.caption(f"Σταθερό seed τυχαιότητας: {seed} (ίδια δεδομένα → ίδια αποτελέσματα). "
                f"Επίπεδο εμπιστοσύνης: {conf} (διάστημα Wilson).")
 
-    st.markdown("**Σύγκριση: αναλυτικό Poisson έναντι Monte Carlo**")
-    st.dataframe(mc_comparison_table(p, analytic, mc), hide_index=True, use_container_width=True)
+    st.markdown(f"**Σύγκριση: {exact_label} έναντι Monte Carlo**")
+    st.dataframe(mc_comparison_table(p, analytic, mc, exact_label), hide_index=True, use_container_width=True)
     st.caption("π.μ. = ποσοστιαίες μονάδες. Μικρές διαφορές είναι αναμενόμενος στατιστικός θόρυβος και "
                "μειώνονται όσο αυξάνονται οι προσομοιώσεις. Ένα «⚠️ Όχι» μπορεί να εμφανιστεί τυχαία "
                f"(περίπου στο {1 - mc.confidence:.0%} των αγορών) και δεν σημαίνει σφάλμα του μοντέλου.")
@@ -216,11 +268,15 @@ def monte_carlo_tab(result: dict) -> None:
     st.markdown("**Ημίχρονο**")
     h1, h2 = st.columns(2)
     with h1:
-        st.dataframe(pd.DataFrame([{"Αγορά": label, "Poisson (αναλυτικά)": f"{analytic[k]:.2%}",
-                                    "Monte Carlo": f"{mc.probabilities[k]:.2%}",
-                                    f"Διάστημα {conf}": f"{mc.intervals[k][0]:.2%} – {mc.intervals[k][1]:.2%}"}
-                                   for k, label in MC_HALFTIME_MARKETS.items()]),
-                     hide_index=True, use_container_width=True)
+        ht_rows = []
+        for k, label in MC_HALFTIME_MARKETS.items():
+            row = {"Αγορά": label}
+            if k in analytic:
+                row["Poisson (αναλυτικά)"] = f"{analytic[k]:.2%}"
+            row["Monte Carlo"] = f"{mc.probabilities[k]:.2%}"
+            row[f"Διάστημα {conf}"] = f"{mc.intervals[k][0]:.2%} – {mc.intervals[k][1]:.2%}"
+            ht_rows.append(row)
+        st.dataframe(pd.DataFrame(ht_rows), hide_index=True, use_container_width=True)
     with h2:
         htft = sorted(mc.halftime_fulltime.items(), key=lambda kv: kv[1], reverse=True)
         st.dataframe(pd.DataFrame([{"Ημίχρονο/Τελικό": k, "Πιθανότητα": f"{v:.2%}"} for k, v in htft]),
@@ -228,6 +284,61 @@ def monte_carlo_tab(result: dict) -> None:
     st.warning(f"Παραδοχή μοντέλου (όχι μετρημένο στατιστικό): κάθε γκολ πέφτει στο 1ο ημίχρονο με πιθανότητα "
                f"{mc.first_half_share:.0%}, ανεξάρτητα από τα υπόλοιπα. Οι αγορές ημιχρόνου χρειάζονται "
                "βαθμονόμηση με πραγματικά δεδομένα ημιχρόνων πριν θεωρηθούν αξιόπιστες.")
+
+
+DC_COMPARISON_MARKETS = ("1", "X", "2", "1X", "X2", "12", "Over 1.5", "Under 1.5",
+                         "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", "GG", "NG")
+
+
+def dixon_coles_tab(result: dict) -> None:
+    if "dixon_coles" not in result:
+        st.warning("Το μοντέλο Dixon-Coles δεν μπόρεσε να υπολογιστεί για αυτόν τον αγώνα: "
+                   f"{result.get('dixon_coles_error', 'άγνωστη αιτία')} Τα αποτελέσματα Poisson παραμένουν διαθέσιμα.")
+        return
+    dc = result["dixon_coles"]
+    pred, summary = dc["prediction"], dc["summary"]
+    p = result["probabilities"]
+    st.caption("Το Dixon-Coles εκτιμά μαζί, για όλες τις ομάδες, επιθετική και αμυντική δύναμη, πλεονέκτημα έδρας "
+               "και μια διόρθωση για τα χαμηλά σκορ. Οι πρόσφατοι αγώνες μετράνε περισσότερο. "
+               "Χρησιμοποιούνται μόνο αγώνες πριν από την ώρα έναρξης.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Αναμ. γκολ γηπεδούχου (DC)", f"{pred.lambda_home:.2f}", f"{pred.lambda_home - result['expected_home']:+.2f} vs Poisson",
+              delta_color="off")
+    m2.metric("Αναμ. γκολ φιλοξενούμενου (DC)", f"{pred.lambda_away:.2f}", f"{pred.lambda_away - result['expected_away']:+.2f} vs Poisson",
+              delta_color="off")
+    m3.metric("Πλεονέκτημα έδρας", f"×{math.exp(dc['home_advantage']):.2f}")
+    m4.metric("ρ (διόρθωση χαμηλών σκορ)", f"{pred.rho:+.3f}")
+
+    rows = []
+    for k in DC_COMPARISON_MARKETS:
+        rows.append({"Αγορά": k, "Poisson": f"{p[k]:.1%}", "Dixon-Coles": f"{pred.probabilities[k]:.1%}",
+                     "Διαφορά (π.μ.)": f"{100 * (pred.probabilities[k] - p[k]):+.1f}",
+                     "Δίκαιη απόδοση DC": round(1 / pred.probabilities[k], 2) if pred.probabilities[k] > 0 else None})
+    st.markdown("**Poisson έναντι Dixon-Coles**")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**5 πιθανότερα ακριβή σκορ (Dixon-Coles)**")
+        st.dataframe(pd.DataFrame([{"Σκορ": s, "Πιθανότητα": f"{v:.1%}"} for s, v in pred.top_scores]), hide_index=True)
+    with right:
+        st.markdown("**Τι σημαίνουν οι παράμετροι**")
+        st.write(f"- **Πλεονέκτημα έδρας ×{math.exp(dc['home_advantage']):.2f}:** ο γηπεδούχος σκοράρει τόσες φορές "
+                 "περισσότερα γκολ από ό,τι θα σκόραρε η ίδια ομάδα σε ουδέτερο γήπεδο.")
+        st.write(f"- **ρ = {pred.rho:+.3f}:** αρνητικό ρ σημαίνει ότι τα 0-0 και 1-1 είναι λίγο συχνότερα (και τα 1-0/0-1 "
+                 "λίγο σπανιότερα) από ό,τι προβλέπει το απλό Poisson. Κοντά στο 0 = σχεδόν καμία διόρθωση.")
+        if pred.rho_clipped:
+            st.caption(f"Το ρ του μοντέλου ({dc['rho']:+.3f}) περιορίστηκε σε {pred.rho:+.3f} για αυτόν τον αγώνα, "
+                       "ώστε να μην προκύψουν αρνητικές πιθανότητες.")
+    st.caption(f"Εκπαίδευση σε {summary.n_matches} αγώνες ({summary.first_match:%d/%m/%Y} – {summary.last_match:%d/%m/%Y}). "
+               f"Χρονική απόσβεση ξ = {summary.xi:.5f}/ημέρα (ένας αγώνας πριν από ~{math.log(2) / summary.xi:.0f} ημέρες "
+               "μετράει το μισό). Το ξ είναι η τιμή της βιβλιογραφίας (Dixon & Coles 1997, αγγλικά πρωταθλήματα) "
+               "και δεν έχει ρυθμιστεί σε αυτά τα δεδομένα.")
+    if min(abs(dc["rho"] - bound) for bound in RHO_BOUNDS) < 1e-3:
+        st.warning(f"Το ρ έφτασε στο όριο που επιτρέπει ο αλγόριθμος ({dc['rho']:+.3f}). Συνήθως αυτό σημαίνει ότι "
+                   "οι αγώνες δεν είναι αρκετοί για να εκτιμηθεί αξιόπιστα η διόρθωση χαμηλών σκορ· "
+                   "οι πιθανότητες για 0-0/1-1 και για την ισοπαλία μπορεί να είναι παραμορφωμένες.")
+    if not summary.converged:
+        st.warning(f"Ο αλγόριθμος εκτίμησης δεν συνέκλινε πλήρως ({summary.message}). Αντιμετώπισε τα αποτελέσματα με επιφύλαξη.")
 
 
 def scorecard(result: dict) -> None:
@@ -245,7 +356,7 @@ def scorecard(result: dict) -> None:
     c3.metric("Over 2.5", f"{p['Over 2.5']:.1%}")
     c4.metric("GG", f"{p['GG']:.1%}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Σύγκριση αποδόσεων", "Monte Carlo"])
+    tab1, tab2, tab_dc, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Dixon-Coles", "Σύγκριση αποδόσεων", "Monte Carlo"])
     with tab1:
         rows = []
         markets = ["1", "X", "2", "1X", "X2", "12", "Over 1.5", "Under 1.5", "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", "GG", "NG"]
@@ -293,6 +404,8 @@ def scorecard(result: dict) -> None:
                        "τα σφάλματα πιθανοτήτων μπορούν να ανατρέψουν πλήρως το συμπέρασμα.")
         else:
             st.info("Βάλε τουλάχιστον μία απόδοση ≥ 1.01 για να δεις τη σύγκριση.")
+    with tab_dc:
+        dixon_coles_tab(result)
     with tab4:
         monte_carlo_tab(result)
 
@@ -380,7 +493,7 @@ else:
 
 if st.button("🔎 Ανάλυση αγώνα", type="primary", use_container_width=True):
     try:
-        st.session_state["prediction"] = analyze(history, home, away, kickoff)
+        st.session_state["prediction"] = add_dixon_coles(analyze(history, home, away, kickoff), history)
         st.session_state["prediction_key"] = (source, competition_label, home, away, str(pd.Timestamp(kickoff)))
     except ValueError as exc:
         st.session_state.pop("prediction", None)
@@ -430,19 +543,54 @@ if "batch_result" in st.session_state and st.session_state.get("batch_key") == (
 st.divider()
 st.header("3. Έλεγχος μοντέλου σε παλιούς αγώνες")
 st.write("Το backtest ελέγχει τις εκτιμήσεις μόνο με πληροφορίες που ήταν γνωστές πριν από κάθε αγώνα. "
-         "Συγκρίνει το μοντέλο με έναν απλό ιστορικό μέσο όρο του πρωταθλήματος.")
-if st.button("▶ Εκτέλεση backtest έως 60 αγώνων"):
+         "Συγκρίνει **τρία μοντέλα στους ίδιους ακριβώς αγώνες**: Poisson (το βασικό μοντέλο της εφαρμογής), "
+         "Dixon-Coles και μια απλή «Βάση» (ιστορικές συχνότητες 1/Χ/2 του πρωταθλήματος).")
+bt_matches = st.slider("Πόσοι από τους πιο πρόσφατους αγώνες θα ελεγχθούν", min_value=30, max_value=200,
+                       value=config.BACKTEST_DEFAULT_MATCHES, step=10)
+BT_REFIT_DAYS = 7
+bt_key = (source, competition_label, len(history), bt_matches)
+if st.button(f"▶ Εκτέλεση συγκριτικού backtest ({bt_matches} αγώνες)"):
     try:
-        test = backtest(history)
-        q1, q2, q3, q4 = st.columns(4)
-        q1.metric("Αγώνες ελέγχου", test["count"])
-        q2.metric("1Χ2 accuracy", f"{test['accuracy']:.1%}")
-        q3.metric("Brier μοντέλου (χαμηλότερο καλύτερο)", f"{test['brier']:.3f}")
-        q4.metric("Brier απλής βάσης", f"{test['baseline_brier']:.3f}")
-        st.caption(f"Ακρίβεια απλής βάσης: {test['baseline_accuracy']:.1%}. "
-                   "Πρόκειται για ιστορικό έλεγχο συγκεκριμένου δείγματος, όχι για απόδειξη μελλοντικών κερδών.")
+        with st.spinner("Εκτέλεση backtest... Το Dixon-Coles εκπαιδεύεται ξανά για κάθε εβδομάδα αγώνων."):
+            st.session_state["comparison"] = compare_models(history, n_matches=bt_matches, refit_days=BT_REFIT_DAYS)
+        st.session_state["comparison_key"] = bt_key
     except ValueError as exc:
+        st.session_state.pop("comparison", None)
         st.warning(str(exc))
+
+if "comparison" in st.session_state and st.session_state.get("comparison_key") == bt_key:
+    cmp_res = st.session_state["comparison"]
+    table = cmp_res.metrics.copy()
+    best_brier = table.loc[table["Brier 1Χ2"].idxmin(), "Μοντέλο"]
+    best_logloss = table.loc[table["Log loss 1Χ2"].idxmin(), "Μοντέλο"]
+    table["Ακρίβεια 1Χ2"] = table["Ακρίβεια 1Χ2"].map(lambda v: f"{v:.1%}")
+    for col in ("Brier 1Χ2", "Log loss 1Χ2", "Brier Over 2.5"):
+        table[col] = table[col].map(lambda v: f"{v:.4f}")
+    st.dataframe(table, hide_index=True, use_container_width=True)
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Αγώνες που ελέγχθηκαν", cmp_res.evaluated)
+    q2.metric("Αγώνες που παραλείφθηκαν", cmp_res.skipped)
+    q3.metric("Εκπαιδεύσεις Dixon-Coles", cmp_res.dc_refits)
+    q4.metric("Χρόνος εκτέλεσης", f"{cmp_res.elapsed_seconds:.1f} δευτ.")
+    if cmp_res.skip_reasons:
+        st.caption("Λόγοι παράλειψης: " + " · ".join(f"{reason}: {count}" for reason, count in cmp_res.skip_reasons.items()))
+    if cmp_res.dc_not_converged:
+        st.warning(f"Σε {cmp_res.dc_not_converged} από τις {cmp_res.dc_refits} εκπαιδεύσεις το Dixon-Coles δεν συνέκλινε πλήρως· "
+                   "τα αποτελέσματά του εδώ να διαβάζονται με επιφύλαξη.")
+    st.info(f"Σε αυτό το δείγμα, το χαμηλότερο Brier 1Χ2 το έχει το **{best_brier}** "
+            f"και το χαμηλότερο log loss το **{best_logloss}**.")
+    st.markdown(
+        "**Πώς διαβάζεται ο πίνακας**\n"
+        "- **Brier 1Χ2:** πόσο απέχουν οι πιθανότητες από αυτό που έγινε. Από 0 (τέλειο) έως 2 (χειρότερο). "
+        "**Χαμηλότερο = καλύτερο.**\n"
+        "- **Log loss 1Χ2:** τιμωρεί πολύ αυστηρά τις «σίγουρες» προβλέψεις που βγήκαν λάθος. **Χαμηλότερο = καλύτερο.**\n"
+        "- **Brier Over 2.5:** το ίδιο με το Brier, για την αγορά Over/Under 2.5 (0 έως 1). **Χαμηλότερο = καλύτερο.**\n"
+        "- **Ακρίβεια 1Χ2:** πόσο συχνά το πιθανότερο σημείο ήταν το σωστό. Μόνη της μπορεί να παραπλανήσει, "
+        "γιατί δεν δείχνει αν οι πιθανότητες ήταν σωστά βαθμονομημένες."
+    )
+    st.caption(f"Το Dixon-Coles εκπαιδεύεται ξανά ανά {cmp_res.refit_days} ημέρες, κάθε φορά μόνο με αγώνες αυστηρά πριν από "
+               "την αρχή του διαστήματος. Το Poisson και η Βάση υπολογίζονται ξεχωριστά για κάθε αγώνα με ό,τι ήταν γνωστό πριν από αυτόν. "
+               "Πρόκειται για ιστορικό έλεγχο συγκεκριμένου δείγματος, όχι για απόδειξη μελλοντικών κερδών.")
 
 with st.expander("Μεθοδολογία και όρια"):
     st.markdown("""
@@ -450,6 +598,9 @@ with st.expander("Μεθοδολογία και όρια"):
     - **Χωρίς χρονική διαρροή:** χρησιμοποιούνται αποτελέσματα αυστηρά πριν από τη δηλωμένη ώρα έναρξης.
     - **Εκτιμώμενα γκολ λ (όχι πραγματικά xG):** σταθμισμένη πρόσφατη επίδοση, έδρα, ισχύς αντιπάλου και εξομάλυνση στους μέσους όρους της λίγκας.
     - **Poisson:** υπολογίζονται όλες οι βασικές πιθανότητες από την κατανομή πιθανών σκορ.
+    - **Dixon-Coles:** δεύτερο, ανεξάρτητο μοντέλο με επίθεση/άμυνα ανά ομάδα, κοινό πλεονέκτημα έδρας, χρονική απόσβεση (πιο πρόσφατα ματς μετράνε περισσότερο) και διόρθωση ρ για τα χαμηλά σκορ (0-0, 1-0, 0-1, 1-1). Η τιμή απόσβεσης ξ είναι προεπιλογή από τη βιβλιογραφία, δεν έχει ρυθμιστεί ακόμη στα δικά σου δεδομένα.
+    - **Monte Carlo:** προσομοιώνει χιλιάδες αγώνες είτε με τα αναμενόμενα γκολ του Poisson είτε με τον πίνακα σκορ του Dixon-Coles.
+    - **Συγκριτικό backtest:** Poisson, Dixon-Coles και απλή βάση στους ίδιους αγώνες, μόνο με πληροφορίες πριν από κάθε αγώνα (Brier, log loss, ακρίβεια).
     - **Αβεβαιότητα:** μικρό δείγμα, αλλαγές προπονητή, μεταγραφές, απουσίες, πρόγραμμα και ισχύς αντιπάλων δεν μοντελοποιούνται πλήρως.
     - **Αποδόσεις:** χωρίς αυτόματη λήψη στοιχηματικών αποδόσεων· μπορείς να καταχωρίσεις δικές σου για ενδεικτικό EV.
     - **Πρόκειται για στατιστικό baseline, όχι για εκπαιδευμένο βαθύ νευρωνικό δίκτυο ή αυτόματο LLM.** Απαιτεί αναβαθμίσεις, περισσότερα δεδομένα και calibration πριν θεωρηθεί αξιόπιστο παραγωγικό betting model.
