@@ -18,6 +18,7 @@ from data_provider import competitions, competition_matches, FootballAPIError
 from models.monte_carlo import MonteCarloResult, analytical_probabilities, simulate_match
 from models.dixon_coles import RHO_BOUNDS, DixonColesModel
 from models.elo import EloModel
+from models.ensemble import ENSEMBLE_MODELS, EnsembleWeights, combine
 from backtesting.compare import compare_models
 import warnings
 import numpy as np
@@ -149,6 +150,34 @@ def add_elo(result: dict, history_df: pd.DataFrame) -> dict:
     except ValueError as exc:
         result.pop("elo", None)
         result["elo_error"] = str(exc)
+    return result
+
+
+ENSEMBLE_BACKTEST_MATCHES = config.BACKTEST_DEFAULT_MATCHES
+
+
+@st.cache_data(max_entries=8, show_spinner=False)
+def cached_ensemble_weights(history_df: pd.DataFrame, cutoff_iso: str) -> tuple[EnsembleWeights, str | None]:
+    """Learn ensemble weights from a leakage-free backtest on matches strictly before the kickoff."""
+    past = prepare_history(history_df)
+    past = past[past.date < pd.Timestamp(cutoff_iso).tz_convert("UTC")]
+    try:
+        res = compare_models(past, n_matches=ENSEMBLE_BACKTEST_MATCHES, refit_days=7)
+        return res.ensemble_weights, None
+    except ValueError as exc:
+        return EnsembleWeights.equal(), str(exc)
+
+
+def add_ensemble(result: dict, history_df: pd.DataFrame) -> dict:
+    """Attach the Poisson + Dixon-Coles + Elo ensemble (needs add_dixon_coles/add_elo first)."""
+    model_probs = {"Poisson": result["probabilities"]}
+    if "dixon_coles" in result:
+        model_probs["Dixon-Coles"] = result["dixon_coles"]["prediction"].probabilities
+    if "elo" in result:
+        model_probs["Elo"] = result["elo"]["prediction"].probabilities
+    weights, error = cached_ensemble_weights(history_df, pd.Timestamp(result["kickoff"]).isoformat())
+    result["ensemble"] = {**combine(model_probs, weights), "weights": weights, "weights_error": error,
+                          "models": list(model_probs)}
     return result
 
 
@@ -430,6 +459,66 @@ def elo_tab(result: dict) -> None:
     )
 
 
+ENSEMBLE_MARKETS = ("1", "X", "2", "1X", "X2", "12", "Over 2.5", "Under 2.5", "GG", "NG")
+
+
+def ensemble_tab(result: dict) -> None:
+    ens = result.get("ensemble")
+    if not ens:
+        st.info("Πάτησε «Ανάλυση αγώνα» για να υπολογιστεί το Ensemble.")
+        return
+    p, weights = ens["probabilities"], ens["weights"]
+    st.caption("Το Ensemble ενώνει τις πιθανότητες των Poisson, Dixon-Coles και Elo σε μία, με σταθμισμένο μέσο όρο. "
+               "Τα βάρη μαθαίνονται από έλεγχο σε παλιούς αγώνες (μόνο πριν από την ώρα έναρξης).")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("1 · Γηπεδούχος", f"{p['1']:.1%}")
+    m2.metric("X · Ισοπαλία", f"{p['X']:.1%}")
+    m3.metric("2 · Φιλοξενούμενος", f"{p['2']:.1%}")
+    m4.metric("Over 2.5", f"{p['Over 2.5']:.1%}")
+    m5.metric("GG", f"{p['GG']:.1%}")
+
+    sources = {"Poisson": result["probabilities"]}
+    if "dixon_coles" in result:
+        sources["Dixon-Coles"] = result["dixon_coles"]["prediction"].probabilities
+    if "elo" in result:
+        sources["Elo"] = result["elo"]["prediction"].probabilities
+    rows = []
+    for k in ENSEMBLE_MARKETS:
+        row = {"Αγορά": k}
+        row.update({name: f"{probs[k]:.1%}" for name, probs in sources.items()})
+        row["Ensemble"] = f"{p[k]:.1%}"
+        row["Δίκαιη απόδοση Ensemble"] = round(1 / p[k], 2) if p[k] > 0.005 else None
+        rows.append(row)
+    st.markdown("**Σύγκριση μοντέλων και Ensemble**")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**Βάρη που χρησιμοποιήθηκαν**")
+    st.dataframe(pd.DataFrame([{"Μοντέλο": name, "Βάρος 1Χ2": f"{ens['w_1x2'][name]:.0%}",
+                                "Βάρος Over/GG": f"{ens['w_goals'][name]:.0%}"} for name in ens["models"]]),
+                 hide_index=True, use_container_width=True)
+    missing = [m for m in ENSEMBLE_MODELS if m not in ens["models"]]
+    if missing:
+        st.warning(f"Δεν ήταν διαθέσιμο για αυτόν τον αγώνα: {', '.join(missing)}. "
+                   "Τα βάρη των υπόλοιπων μοντέλων αναπροσαρμόστηκαν ώστε να αθροίζουν 100%.")
+    if ens["weights_error"]:
+        st.warning("Δεν ήταν δυνατός ο έλεγχος σε παλιούς αγώνες για τον υπολογισμό βαρών "
+                   f"({ens['weights_error']}). Χρησιμοποιούνται **ίσα βάρη**.")
+    elif not weights.fitted:
+        st.warning(f"Μόνο {weights.n_matches} παλιοί αγώνες ήταν διαθέσιμοι για τον υπολογισμό βαρών "
+                   f"(χρειάζονται τουλάχιστον {config.ENSEMBLE_MIN_MATCHES}). Χρησιμοποιούνται **ίσα βάρη**.")
+    else:
+        st.caption(f"Τα βάρη υπολογίστηκαν από {weights.n_matches} παλιούς αγώνες (έως {ENSEMBLE_BACKTEST_MATCHES} "
+                   "πιο πρόσφατους πριν από την ώρα έναρξης), ώστε να ελαχιστοποιείται το log loss. "
+                   f"Με λίγους αγώνες τα βάρη «τραβιούνται» προς το ίσο μοίρασμα (προεπιλογή: "
+                   f"{config.ENSEMBLE_PRIOR_MATCHES} εικονικοί αγώνες).")
+    st.markdown("**Γιατί Ensemble**")
+    st.write("- Κάθε μοντέλο κάνει διαφορετικά λάθη. Ο μέσος όρος τους συνήθως είναι πιο σταθερός από το καθένα χωριστά.")
+    st.write("- Μεγαλύτερο βάρος παίρνει το μοντέλο που τα πήγε καλύτερα στους παλιούς αγώνες.")
+    st.write("- Δεν είναι εγγυημένα καλύτερο· δες τη γραμμή «Ensemble» στο συγκριτικό backtest (ενότητα 3).")
+    st.caption("Τα βάρη Over/GG μαθαίνονται μόνο από την αγορά Over 2.5 και εφαρμόζονται και στο GG/NG (παραδοχή). "
+               "Οι εκτιμήσεις Over/GG του Elo είναι αδρές.")
+
+
 def scorecard(result: dict) -> None:
     p = result["probabilities"]
     st.subheader(f"{result['home']}  —  {result['away']}")
@@ -445,7 +534,8 @@ def scorecard(result: dict) -> None:
     c3.metric("Over 2.5", f"{p['Over 2.5']:.1%}")
     c4.metric("GG", f"{p['GG']:.1%}")
 
-    tab1, tab2, tab_dc, tab_elo, tab3, tab4 = st.tabs(["Προγνωστικά", "Πώς προκύπτουν", "Dixon-Coles", "Elo", "Σύγκριση αποδόσεων", "Monte Carlo"])
+    tab1, tab2, tab_dc, tab_elo, tab_ens, tab3, tab4 = st.tabs(
+        ["Προγνωστικά", "Πώς προκύπτουν", "Dixon-Coles", "Elo", "Ensemble", "Σύγκριση αποδόσεων", "Monte Carlo"])
     with tab1:
         rows = []
         markets = ["1", "X", "2", "1X", "X2", "12", "Over 1.5", "Under 1.5", "Over 2.5", "Under 2.5", "Over 3.5", "Under 3.5", "GG", "NG"]
@@ -497,6 +587,8 @@ def scorecard(result: dict) -> None:
         dixon_coles_tab(result)
     with tab_elo:
         elo_tab(result)
+    with tab_ens:
+        ensemble_tab(result)
     with tab4:
         monte_carlo_tab(result)
 
@@ -584,7 +676,9 @@ else:
 
 if st.button("🔎 Ανάλυση αγώνα", type="primary", use_container_width=True):
     try:
-        st.session_state["prediction"] = add_elo(add_dixon_coles(analyze(history, home, away, kickoff), history), history)
+        with st.spinner("Ανάλυση με Poisson, Dixon-Coles, Elo και υπολογισμός βαρών Ensemble..."):
+            st.session_state["prediction"] = add_ensemble(
+                add_elo(add_dixon_coles(analyze(history, home, away, kickoff), history), history), history)
         st.session_state["prediction_key"] = (source, competition_label, home, away, str(pd.Timestamp(kickoff)))
     except ValueError as exc:
         st.session_state.pop("prediction", None)
@@ -634,7 +728,7 @@ if "batch_result" in st.session_state and st.session_state.get("batch_key") == (
 st.divider()
 st.header("3. Έλεγχος μοντέλου σε παλιούς αγώνες")
 st.write("Το backtest ελέγχει τις εκτιμήσεις μόνο με πληροφορίες που ήταν γνωστές πριν από κάθε αγώνα. "
-         "Συγκρίνει **τέσσερα μοντέλα στους ίδιους ακριβώς αγώνες**: Poisson, Dixon-Coles, Elo "
+         "Συγκρίνει **πέντε μοντέλα στους ίδιους ακριβώς αγώνες**: Poisson, Dixon-Coles, Elo, Ensemble "
          "και μια απλή «Βάση» (ιστορικές συχνότητες 1/Χ/2 του πρωταθλήματος).")
 bt_matches = st.slider("Πόσοι από τους πιο πρόσφατους αγώνες θα ελεγχθούν", min_value=30, max_value=200,
                        value=config.BACKTEST_DEFAULT_MATCHES, step=10)
@@ -681,6 +775,8 @@ if "comparison" in st.session_state and st.session_state.get("comparison_key") =
     )
     st.caption(f"Το Dixon-Coles εκπαιδεύεται ξανά ανά {cmp_res.refit_days} ημέρες, κάθε φορά μόνο με αγώνες αυστηρά πριν από "
                "την αρχή του διαστήματος. Το Poisson και η Βάση υπολογίζονται ξεχωριστά για κάθε αγώνα με ό,τι ήταν γνωστό πριν από αυτόν. "
+               f"Το Ensemble, για κάθε αγώνα, μαθαίνει βάρη μόνο από τους προηγούμενους ελεγμένους αγώνες "
+               f"(ίσα βάρη μέχρι να υπάρξουν {config.ENSEMBLE_MIN_MATCHES}), οπότε στα πρώτα ματς του δείγματος είναι απλός μέσος όρος. "
                "Πρόκειται για ιστορικό έλεγχο συγκεκριμένου δείγματος, όχι για απόδειξη μελλοντικών κερδών.")
 
 with st.expander("Μεθοδολογία και όρια"):
@@ -692,7 +788,8 @@ with st.expander("Μεθοδολογία και όρια"):
     - **Dixon-Coles:** δεύτερο, ανεξάρτητο μοντέλο με επίθεση/άμυνα ανά ομάδα, κοινό πλεονέκτημα έδρας, χρονική απόσβεση (πιο πρόσφατα ματς μετράνε περισσότερο) και διόρθωση ρ για τα χαμηλά σκορ (0-0, 1-0, 0-1, 1-1). Η τιμή απόσβεσης ξ είναι προεπιλογή από τη βιβλιογραφία, δεν έχει ρυθμιστεί ακόμη στα δικά σου δεδομένα.
     - **Monte Carlo:** προσομοιώνει χιλιάδες αγώνες είτε με τα αναμενόμενα γκολ του Poisson είτε με τον πίνακα σκορ του Dixon-Coles.
     - **Elo:** σύστημα βαθμολογίας δύναμης ανά ομάδα. Σταθερό ακόμα και με λίγα δεδομένα, αλλά δεν μοντελοποιεί αριθμό γκολ — οι αγορές Over/GG είναι αδρές εκτιμήσεις.
-    - **Συγκριτικό backtest:** Poisson, Dixon-Coles, Elo και απλή βάση στους ίδιους αγώνες, μόνο με πληροφορίες πριν από κάθε αγώνα (Brier, log loss, ακρίβεια).
+    - **Ensemble:** σταθμισμένος μέσος όρος των πιθανοτήτων Poisson, Dixon-Coles και Elo. Τα βάρη μαθαίνονται από backtest σε αγώνες πριν από την ώρα έναρξης (ελαχιστοποίηση log loss, με «τράβηγμα» προς ίσα βάρη όταν τα δεδομένα είναι λίγα).
+    - **Συγκριτικό backtest:** Poisson, Dixon-Coles, Elo, Ensemble και απλή βάση στους ίδιους αγώνες, μόνο με πληροφορίες πριν από κάθε αγώνα (Brier, log loss, ακρίβεια).
     - **Αβεβαιότητα:** μικρό δείγμα, αλλαγές προπονητή, μεταγραφές, απουσίες, πρόγραμμα και ισχύς αντιπάλων δεν μοντελοποιούνται πλήρως.
     - **Αποδόσεις:** χωρίς αυτόματη λήψη στοιχηματικών αποδόσεων· μπορείς να καταχωρίσεις δικές σου για ενδεικτικό EV.
     - **Πρόκειται για στατιστικό baseline, όχι για εκπαιδευμένο βαθύ νευρωνικό δίκτυο ή αυτόματο LLM.** Απαιτεί αναβαθμίσεις, περισσότερα δεδομένα και calibration πριν θεωρηθεί αξιόπιστο παραγωγικό betting model.
